@@ -117,10 +117,8 @@ main() {
   if [[ "${container_id_raw}" =~ ^docker:// ]]; then
     exit_err "Docker runtime is no longer supported. Please use CRI-O or containerd runtime. Container ID: ${container_id_raw}"
   elif [[ "${container_id_raw}" =~ ^cri-o:// ]]; then
-    runtime="cri-o"
     cid=$(echo "${container_id_raw}" | sed 's/cri-o:\/\///')
   elif [[ "${container_id_raw}" =~ ^containerd:// ]]; then
-    runtime="containerd"
     cid=$(echo "${container_id_raw}" | sed 's/containerd:\/\///')
   else
     exit_err "unsupported container runtime: ${container_id_raw}. Supported runtimes: cri-o, containerd"
