@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
-# pod debugging tool for kubernetes clusters with docker runtimes
+# pod debugging tool for kubernetes clusters with CRI-O and containerd runtimes
+# Note: Docker runtime support has been deprecated and removed
 
 # Copyright © 2019 Hua Zhihao <ihuazhihao@gmail.com>
 #
@@ -29,7 +30,8 @@ usage() {
   fi
 
   cat <<EOF
-kubespy is a pod debugging tool for kubernetes clusters with docker runtimes
+kubespy is a pod debugging tool for kubernetes clusters with CRI-O and containerd runtimes
+Note: Docker runtime support has been deprecated and removed
 
 Usage:
 
@@ -49,8 +51,8 @@ Examples:
   # specify spy-image
   $SELF spy mypod --spy-image busybox
 
-  # specify entrypoint for interaction
-  $SELF spy mypod --entrypoint /bin/sh
+  # specify fallback entrypoint (script tries /bin/bash first, then this, then /bin/sh)
+  $SELF spy mypod --entrypoint /bin/bash
 
 EOF
 }
@@ -99,21 +101,56 @@ main() {
   co=${co:-""}
   ns=${ns:-"$(kubectl config view --minify -o 'jsonpath={..namespace}')"}
   ep=${ep:-"docker.io/busybox:latest"}
+  # entrypoint is used as fallback if /bin/bash doesn't exist in target container
+  # Default to /bin/sh, but the script will try /bin/bash first automatically
   entrypnt=${entrypnt:-"/bin/sh"}
 
   no=$(kubectl -n "${ns}" get pod "${po}" -o "jsonpath={.spec.nodeName}") || exit_err "cannot found Pod ${po}'s nodeName"
   if [[ "${co}" == "" ]]; then
-    cid=$(kubectl -n "${ns}" get pod "${po}" -o='jsonpath={.status.containerStatuses[0].containerID}' | sed 's/docker:\/\///')
+    container_id_raw=$(kubectl -n "${ns}" get pod "${po}" -o='jsonpath={.status.containerStatuses[0].containerID}')
   else
-    cid=$(kubectl -n "${ns}" get pod "${po}" -o='jsonpath={.status.containerStatuses[?(@.name=="'"${co}"'")].containerID}' | sed 's/docker:\/\///')
+    container_id_raw=$(kubectl -n "${ns}" get pod "${po}" -o='jsonpath={.status.containerStatuses[?(@.name=="'"${co}"'")].containerID}')
+  fi
+
+  # Detect container runtime and extract container ID
+  # Note: Docker runtime support has been deprecated and removed
+  if [[ "${container_id_raw}" =~ ^docker:// ]]; then
+    exit_err "Docker runtime is no longer supported. Please use CRI-O or containerd runtime. Container ID: ${container_id_raw}"
+  elif [[ "${container_id_raw}" =~ ^cri-o:// ]]; then
+    runtime="cri-o"
+    cid=$(echo "${container_id_raw}" | sed 's/cri-o:\/\///')
+  elif [[ "${container_id_raw}" =~ ^containerd:// ]]; then
+    runtime="containerd"
+    cid=$(echo "${container_id_raw}" | sed 's/containerd:\/\///')
+  else
+    exit_err "unsupported container runtime: ${container_id_raw}. Supported runtimes: cri-o, containerd"
   fi
 
   spyid="spy-${cid:0:12}"
   kubectl -n "${ns}" delete po/"${spyid}" &>/dev/null || true
 
-  overrides="$(
+  # For CRI-O and containerd, get container PID and use nsenter to join namespaces
+  # crictl needs the container runtime ID, not the Kubernetes container ID
+  # Search through all containers to find the one matching our container ID
+  spy_command='["/bin/sh", "-c"]'
+  # Search for container by matching the full container ID in crictl inspect output
+  spy_script="pid=''; cid_found=''; node_name=\$(hostname 2>/dev/null || echo 'unknown'); cid_short=\$(echo ${cid} | cut -c1-13); cid_long=\$(echo ${cid} | cut -c1-64); methods_tried=''; crictl_cmd=''; for p in /usr/bin/crictl /usr/local/bin/crictl /opt/cni/bin/crictl /host/usr/bin/crictl /host/usr/local/bin/crictl; do if [ -x \"\$p\" ] || [ -x \"/host\$p\" ]; then if [ -x \"\$p\" ]; then crictl_cmd=\"\$p\"; else crictl_cmd=\"/host\$p\"; fi; break; fi; done; if [ -z \"\$crictl_cmd\" ]; then crictl_cmd=\$(chroot /host sh -c 'command -v crictl 2>/dev/null || which crictl 2>/dev/null || echo' 2>/dev/null | head -1); fi; if [ -n \"\$crictl_cmd\" ] && [ -x \"\$crictl_cmd\" ] || [ -x \"/host\$crictl_cmd\" ]; then methods_tried=\"\$methods_tried crictl(\$crictl_cmd)\"; for c in \$(chroot /host \"\$crictl_cmd\" ps -q 2>/dev/null || chroot /host sh -c \"\\\$crictl_cmd ps -q\" 2>/dev/null); do if chroot /host \"\$crictl_cmd\" inspect \"\$c\" 2>/dev/null | grep -q \"${cid}\" || chroot /host sh -c \"\\\$crictl_cmd inspect \\\$c\" 2>/dev/null | grep -q \"${cid}\"; then cid_found=\"\$c\"; break; fi; done; if [ -n \"\$cid_found\" ]; then if chroot /host sh -c 'command -v jq' >/dev/null 2>&1; then pid=\$(chroot /host \"\$crictl_cmd\" inspect \"\$cid_found\" 2>/dev/null | chroot /host sh -c 'jq -r .info.pid // empty' 2>/dev/null || chroot /host sh -c \"\\\$crictl_cmd inspect \\\$cid_found\" 2>/dev/null | chroot /host sh -c 'jq -r .info.pid // empty' 2>/dev/null); else pid=\$(chroot /host \"\$crictl_cmd\" inspect \"\$cid_found\" 2>/dev/null | grep -oE '\"pid\":[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | head -1 || chroot /host sh -c \"\\\$crictl_cmd inspect \\\$cid_found\" 2>/dev/null | grep -oE '\"pid\":[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | head -1); fi; fi; fi; if [ -z \"\$pid\" ] || [ \"\$pid\" = \"null\" ] || [ \"\$pid\" = \"\" ]; then methods_tried=\"\$methods_tried proc-cgroup\"; for proc_pid in /proc/[0-9]*; do if [ -f \"\$proc_pid/cgroup\" ]; then if grep -q \"\${cid_short}\" \"\$proc_pid/cgroup\" 2>/dev/null || grep -q \"\${cid_long}\" \"\$proc_pid/cgroup\" 2>/dev/null || grep -q \"${cid}\" \"\$proc_pid/cgroup\" 2>/dev/null; then pid=\$(basename \"\$proc_pid\"); if [ -n \"\$pid\" ] && [ -d \"/proc/\$pid\" ]; then break; fi; fi; fi; done; fi; if [ -z \"\$pid\" ] || [ \"\$pid\" = \"null\" ] || [ \"\$pid\" = \"\" ]; then methods_tried=\"\$methods_tried cgroup-dirs\"; for cgroup_dir in /sys/fs/cgroup/systemd /sys/fs/cgroup/unified /sys/fs/cgroup /sys/fs/cgroup/pids; do if [ -d \"/host\$cgroup_dir\" ]; then for cg in \"/host\$cgroup_dir\"/*/\"\${cid_short}\"* \"/host\$cgroup_dir\"/*/*/\"\${cid_short}\"* \"/host\$cgroup_dir\"/*/\"\${cid_long}\"* \"/host\$cgroup_dir\"/*/*/\"\${cid_long}\"*; do if [ -f \"\$cg/cgroup.procs\" ] || [ -f \"\$cg/tasks\" ]; then pid=\$(head -1 \"\$cg/cgroup.procs\" 2>/dev/null || head -1 \"\$cg/tasks\" 2>/dev/null); if [ -n \"\$pid\" ] && [ -d \"/proc/\$pid\" ]; then break 2; fi; fi; done; fi; done; fi; if [ -z \"\$pid\" ] || [ \"\$pid\" = \"null\" ] || [ \"\$pid\" = \"\" ]; then echo \"Error: Failed to get container PID for ${cid}\"; echo \"Running on node: \$node_name (expected: ${no})\"; echo \"Methods tried: \$methods_tried\"; echo \"Container ID from k8s: ${cid}\"; echo \"Short ID: \${cid_short}, Long ID: \${cid_long}\"; echo \"Sample /proc/*/cgroup entries (first 5):\"; find /proc -maxdepth 2 -name cgroup -type f 2>/dev/null | head -5 | xargs grep -h . 2>/dev/null | head -3 || echo \"Could not read cgroup files\"; exit 1; fi; chroot /host nsenter -t \"\$pid\" -n -p -i -u -m sh -c 'cd / && if [ -x /bin/bash ]; then exec /bin/bash; elif [ -x \"${entrypnt}\" ]; then exec \"${entrypnt}\"; else exec /bin/sh; fi'"
+  # Escape for JSON: " -> \", \ -> \\, but preserve $ as is (will be escaped as needed)
+  spy_script_json=$(printf '%s' "${spy_script}" | sed 's/\\/\\\\/g' | sed 's/"/\\"/g')
+  spy_args="[\"${spy_script_json}\"]"
+
+  echo "loading spy pod ${spyid} on node ${no} (same as target pod) ..."
+  # Create full pod manifest and apply it (replaces deprecated --overrides flag)
+  # nodeName is set to force the spy pod to run on the same node as the target pod
+  pod_manifest="$(
   cat <<EOT
 {
+  "apiVersion": "v1",
+  "kind": "Pod",
+  "metadata": {
+    "name": "${spyid}",
+    "namespace": "${ns}"
+  },
   "spec": {
     "hostNetwork": true,
     "hostPID": true,
@@ -122,22 +159,18 @@ main() {
     "containers": [
       {
         "name": "spy",
-        "image": "docker.io/busybox:latest",
-        "command": [ "/bin/chroot", "/host"],
-        "args": [
-          "docker",
-          "run",
-          "-it",
-          "--network=container:${cid}",
-          "--pid=container:${cid}",
-          "--ipc=container:${cid}",
-          "--entrypoint=${entrypnt}",
-          "--volumes-from=${cid}",
-          "${ep}"
-        ],
+        "image": "${ep}",
+        "command": ${spy_command},
+        "args": ${spy_args},
         "stdin": true,
         "stdinOnce": true,
         "tty": true,
+        "securityContext": {
+          "privileged": true,
+          "capabilities": {
+            "add": ["SYS_ADMIN", "SYS_PTRACE", "NET_ADMIN", "IPC_LOCK"]
+          }
+        },
         "volumeMounts": [
           {
             "mountPath": "/host",
@@ -158,9 +191,41 @@ main() {
 }
 EOT
 )"
-
-  echo "loading spy pod ${spyid} ..."
-  kubectl -n "${ns}" run --rm -i --tty --image="docker.io/busybox:latest" --overrides="${overrides}" --restart=Never "${spyid}" -- "${entrypnt}"
+  
+  # Apply the pod manifest
+  echo "${pod_manifest}" | kubectl -n "${ns}" apply -f - > /dev/null
+  
+  # Wait for pod to be ready, then attach
+  kubectl -n "${ns}" wait --for=condition=Ready pod/"${spyid}" --timeout=60s > /dev/null 2>&1 || true
+  
+  # Verify spy pod is on the correct node
+  spy_node=$(kubectl -n "${ns}" get pod "${spyid}" -o jsonpath='{.spec.nodeName}' 2>/dev/null || echo "")
+  if [[ -n "${spy_node}" && "${spy_node}" != "${no}" ]]; then
+    echo >&2 "Warning: Spy pod is on node ${spy_node}, but target pod is on node ${no}"
+    echo >&2 "This may cause the container lookup to fail. Deleting spy pod..."
+    kubectl -n "${ns}" delete pod "${spyid}" 2>/dev/null || true
+    exit_err "Spy pod was scheduled on wrong node. This should not happen with nodeName set."
+  fi
+  
+  # Function to cleanup spy pod
+  cleanup_spy() {
+    kubectl -n "${ns}" delete pod "${spyid}" --ignore-not-found=true 2>/dev/null || true
+  }
+  
+  # Set trap to cleanup on exit (including normal exit, interrupt, etc.)
+  trap cleanup_spy EXIT INT TERM
+  
+  # Attach to the spy pod
+  # When attach exits (user exits the session), the trap will clean up the pod
+  # Filter stderr to remove misleading "Session ended, resume using..." message
+  # Keep stdout (interactive terminal) untouched to preserve TTY behavior
+  kubectl -n "${ns}" attach -it "${spyid}" 2> >(grep -v --line-buffered "Session ended\|resume using" >&2) || true
+  
+  # Cleanup (trap will also handle this, but explicit cleanup ensures it happens)
+  cleanup_spy
+  
+  # Remove trap since we've cleaned up
+  trap - EXIT INT TERM
 }
 
 main "$@"

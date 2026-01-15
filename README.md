@@ -8,7 +8,44 @@
 
 `kubespy` is similar to [kubectl-debug](https://github.com/verb/kubectl-debug). In contrast to the latter, kubespy works without the EphemeralContainers feature which is an experimental alpha feature and needs to be activated per pod.
 
-Meanwhile `kubespy` has its own prerequisites - the cluster must use docker as container runtime and you need to be able to run privileged pods.
+## This Fork - Updates and Changes
+
+This fork includes significant updates to support modern Kubernetes clusters:
+
+### Runtime Support Changes
+
+**Original kubespy:**
+- Only supported Docker runtime
+- Used `docker run` with `--network=container`, `--pid=container`, etc.
+
+**This fork:**
+- **Docker support has been removed** (deprecated)
+- Supports **CRI-O** and **containerd** runtimes
+- Uses `crictl` to inspect containers and `nsenter` to join namespaces
+- Automatically detects container runtime from pod status
+
+### Technical Improvements
+
+1. **Modern kubectl compatibility**: Replaced deprecated `kubectl run --overrides` with `kubectl apply` using pod manifests
+2. **Runtime detection**: Automatically detects CRI-O (`cri-o://`) and containerd (`containerd://`) container IDs
+3. **Robust container lookup**: Multiple fallback methods to find container PIDs:
+   - `crictl inspect` (primary method)
+   - `/proc/*/cgroup` file scanning
+   - Cgroup directory inspection
+4. **Shell preference**: Automatically tries `/bin/bash` first, falls back to specified entrypoint, then `/bin/sh`
+5. **Auto-cleanup**: Spy pods are automatically deleted when the session ends
+
+### Minimum Kubernetes Version
+
+**Minimum supported: Kubernetes 1.24+**
+
+Kubernetes 1.24 (released April 2022) removed dockershim and made containerd the default container runtime. This fork is designed for Kubernetes clusters running containerd or CRI-O, which are the standard runtimes for modern Kubernetes deployments.
+
+**Requirements:**
+- Kubernetes 1.24 or later
+- CRI-O or containerd container runtime
+- Ability to run privileged pods
+- `crictl` available on cluster nodes (or accessible via host filesystem)
 
 ## Installation
 
@@ -50,8 +87,9 @@ $ kubectl spy mypod -c mycontainer
 # specify spy-image
 $ kubectl spy mypod --spy-image busybox
 
-# specify entrypoint for interaction
-$ kubectl spy mypod --entrypoint /bin/sh
+# specify fallback entrypoint (script automatically tries /bin/bash first)
+# If bash doesn't exist, tries this entrypoint, then falls back to /bin/sh
+$ kubectl spy mypod --entrypoint /bin/bash
 ```
 
 ## Workflow
